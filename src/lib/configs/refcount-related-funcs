@@ -1,0 +1,4 @@
+pm_runtime_get_if_in_use
+pm_runtime_active
+pm_runtime_enabled
+pm_runtime_suspended

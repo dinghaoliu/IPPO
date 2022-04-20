@@ -1,0 +1,6 @@
+pm_runtime_put_noidle
+pm_runtime_put
+pm_runtime_put_autosuspend
+pm_runtime_put_sync
+pm_runtime_put_sync_suspend
+pm_runtime_put_sync_autosuspend

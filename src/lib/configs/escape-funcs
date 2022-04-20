@@ -1,0 +1,14 @@
+snd_device_new
+list_add
+copy_from_user
+list_add_tail
+v4l2_async_subdev_notifier_register
+drbd_genl_multicast_events
+rdma_nl_multicast
+heap_helper_export_dmabuf
+btrfs_sysfs_add_space_info_type
+device_register
+input_register_device
+tty_add_file
+fsi_master_register
+counter_attribute_create

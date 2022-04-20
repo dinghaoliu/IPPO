@@ -1,0 +1,3 @@
+nvkm_device_ctor
+acpi_rs_convert_resource_to_aml
+acpi_rs_convert_aml_to_resource

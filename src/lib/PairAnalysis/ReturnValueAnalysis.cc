@@ -1,0 +1,1265 @@
+#include <llvm/IR/DebugInfo.h>
+#include <llvm/Pass.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Function.h>
+#include <llvm/Support/Debug.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Value.h>
+#include <llvm/IR/CFG.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Analysis/CallGraph.h>
+#include <llvm/IR/Dominators.h>
+
+#include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <omp.h>
+
+#include "PairAnalysis.h"
+
+using namespace llvm;
+using namespace std;
+
+#define ERRNO_PREFIX 0x4cedb000
+#define ERRNO_MASK   0xfffff000
+#define is_errno(x) (((x) & ERRNO_MASK) == ERRNO_PREFIX)
+
+#define ERR_RETURN_MASK 0xF
+#define ERR_HANDLE_MASK 0xF0
+
+// 1: only consider pre-defined default error codes such as EFAULT; 
+// 2: default error codes + <-4095, -1> + NULL pointer
+#define ERRNO_TYPE 	2
+
+//#define OPENSSL_RETURN_STYLE
+
+//#define DEBUG_PRINT
+
+// SelectInsts that take error codes
+set<Instruction *>PairAnalysisPass::ErrSelectInstSet;
+
+/// Check if the returned value must be or may be an errno.
+/// And mark the traversed edges in the CFG.
+void PairAnalysisPass::checkErrReturn(Function *F, 
+		BBErrMap &bbErrMap,
+		std::map<BasicBlock *,Value *> &blockAttributeMap) {
+
+	// Check all return instructions in this function and mark
+	// edges that are sure to return an errno.
+	std::set<Value *> PV;
+	PV.clear();
+
+	for (inst_iterator i = inst_begin(F), e = inst_end(F);
+			i != e; ++i) {
+		ReturnInst *RI = dyn_cast<ReturnInst>(&*i);
+
+		if (!RI)
+			continue;
+
+		// Backtrack returned value
+		checkErrValueFlow(F, RI, PV, bbErrMap, blockAttributeMap);
+	}
+
+	return;
+}
+
+/// Collect all blocks operate on return value
+void PairAnalysisPass::checkErrValueFlow(
+		Function *F,
+		ReturnInst *RI, 
+		std::set<Value *> &PV, 
+		BBErrMap &bbErrMap,
+		std::map<BasicBlock *,Value *> &blockAttributeMap) {
+
+	Value *RV = RI->getReturnValue();
+	if (!RV)
+		return;
+
+	std::list<EdgeValue> EEV;
+	EEV.clear();
+
+	EEV.push_back(std::make_pair(std::make_pair((Instruction *)NULL,
+					RI->getParent()), RV));
+
+	std::map<BasicBlock *,BasicBlock *> BlockMap;
+	BlockMap.clear();
+
+	while (!EEV.empty()) {
+
+		EdgeValue EV = EEV.front();
+		Value *V = EV.second;
+		CFGEdge CE = EV.first;
+		EEV.pop_front();
+
+		if (!V || PV.count(V) != 0)
+			continue;
+		//OP << "V: "<< *V << "\n";
+		PV.insert(V);
+		Instruction *I = dyn_cast<Instruction>(V);
+		if (!I)
+			continue;
+		// Current block
+		BasicBlock *BB = I->getParent();
+		BasicBlock *edgefirstblock = I->getParent();
+		if(CE.first != NULL)
+			edgefirstblock = CE.first->getParent();
+
+		// The value is a load. Let's find out the previous stores.
+		if (auto LI = dyn_cast<LoadInst>(V)) {
+
+			Value *LPO = LI->getPointerOperand();
+			for (User *U : LPO->users()) {
+				if (LI == U)
+					continue;
+				StoreInst *SI = dyn_cast<StoreInst>(U);
+				if (SI && LPO == SI->getPointerOperand()) {
+					Value *SVO = SI->getValueOperand();
+					if (isConstant(SVO)) {
+						if (isValueErrno(SVO, F)) {
+							markBBErr(SI->getParent(), May_Return_Err, bbErrMap);
+							//CFGEdge edge = make_pair(SI->getParent()->getTerminator(),CE.second);
+							//edgeAttributeMap[edge] = Must_Return_Err;
+						}
+						else {
+							// Maybe mark as Not_Return_Err
+							markBBErr(SI->getParent(), Not_Return_Err, bbErrMap);
+							//CFGEdge edge = make_pair(SI->getParent()->getTerminator(),CE.second);
+							//edgeAttributeMap[edge] = Not_Return_Err;
+						}
+					} 
+					else { 
+						CFGEdge	NE = make_pair(SI->getParent()->getTerminator(), BB);
+						EEV.push_back(make_pair(NE, SVO));
+					}
+				}
+			}
+			continue;
+		}
+
+		// The value is a phinode.
+		PHINode *PN = dyn_cast<PHINode>(V);
+		if (PN) {
+			// Check each incoming value.
+			for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+				Value *IV = PN->getIncomingValue(i);
+				BasicBlock *inBB = PN->getIncomingBlock(i);
+
+				// The incoming value is a constant.
+				if (isConstant(IV)) {
+					//OP << "IV: "<<*IV << "\n";
+					if (isValueErrno(IV, F)) {
+						//markBBErr(inBB, Must_Return_Err, bbErrMap);
+						markBBErr(inBB, May_Return_Err, bbErrMap);
+						//CFGEdge edge = make_pair(inBB->getTerminator(),BB);
+						//edgeAttributeMap[edge] = Must_Return_Err;
+						blockAttributeMap[PN->getParent()]=PN;
+					}
+					else {
+						markBBErr(inBB, Not_Return_Err, bbErrMap);
+						//CFGEdge edge = make_pair(inBB->getTerminator(),BB);
+						//edgeAttributeMap[edge] = Not_Return_Err;
+					}
+				} 
+				else {
+					// Add the incoming value and the corresponding edge to the list.
+					Instruction *TI = inBB->getTerminator();
+					EEV.push_back(std::make_pair(std::make_pair(TI, BB), IV));
+				}
+			}
+			continue;
+		}
+
+		// The value is a select instruction.
+		SelectInst *SI = dyn_cast<SelectInst>(V);
+		if (SI) {
+			Value *Cond = SI->getCondition();
+			Value *SV;
+			bool flag1 = false;
+			bool flag2 = false;
+
+			SV = SI->getTrueValue();
+			if (isConstant(SV)) {
+				if(isValueErrno(SV, F)){
+					flag1 = true;
+				}
+			} else {
+				EEV.push_back(std::make_pair(make_pair(SI->getParent()->getTerminator(), BB), 
+							SV));
+			}
+
+			SV = SI->getFalseValue();
+			if (isConstant(SV)) {
+				if (isValueErrno(SV, F)){
+					flag2 = true;
+				}
+			} else {
+				EEV.push_back(std::make_pair(make_pair(SI->getParent()->getTerminator(), BB),
+							SV));
+			}
+
+			if (flag1 && flag2) {
+				markBBErr(SI->getParent(), Must_Return_Err, bbErrMap);
+				//CFGEdge edge = make_pair(SI->getParent()->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = Must_Return_Err;
+			}
+			else if (flag1 || flag2) {
+				//OP << "Here1\n";
+				markBBErr(SI->getParent(), May_Return_Err, bbErrMap);
+				// Only one branch in this case
+				ErrSelectInstSet.insert(SI);
+				//CFGEdge edge = make_pair(SI->getParent()->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = May_Return_Err;
+				//blockAttributeMap[edgefirstblock] = V;
+			}
+			else {
+				markBBErr(SI->getParent(), May_Return_Err, bbErrMap);
+				//CFGEdge edge = make_pair(SI->getParent()->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = Not_Return_Err;
+			}
+
+			continue;
+		}
+		
+		// The value is a getelementptr instruction.
+		GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(V);
+		if (GEP) {
+			Value *PO = GEP->getPointerOperand();
+
+			if (isConstant(PO)) {
+				if (isValueErrno(PO, F)) {
+					markBBErr(GEP->getParent(), Must_Return_Err, bbErrMap);
+					//CFGEdge edge = make_pair(GEP->getParent()->getTerminator(),CE.second);
+					//edgeAttributeMap[edge] = Must_Return_Err;
+				}
+				else {
+					markBBErr(GEP->getParent(), Not_Return_Err, bbErrMap);
+					//CFGEdge edge = make_pair(GEP->getParent()->getTerminator(),CE.second);
+					//edgeAttributeMap[edge] = Not_Return_Err;
+				}
+				continue;
+			} 
+			EEV.push_back(std::make_pair(make_pair(GEP->getParent()->getTerminator(), BB),
+						PO));
+
+			continue;
+		}
+
+		// The value is a call instruction. 
+		CallInst *CaI = dyn_cast<CallInst>(V);
+		if (CaI) {
+			//OP << "Here\n";
+			Function *CF = CaI->getCalledFunction();
+			if (!CF) {
+			//	OP << "here\n";
+			//	continue;
+			}
+			StringRef FName = getCalledFuncName(CaI);
+			//OP << "FName: "<<FName<<"\n";
+			
+			// TODO: may need a list of must-return-error functions
+#if ERRNO_TYPE == 2
+			if (FName == "PTR_ERR" || FName == "ERR_PTR") {
+				if(bbErrMap.count(CaI->getParent()) && bbErrMap[CaI->getParent()] == Not_Return_Err)
+					continue;
+				
+				//Ignore EINPROGRESS
+				//Value *arg = CaI->getArgOperand(0);
+				//if(isConstant(arg))
+				//	if (isValueErrno(arg, F))
+				//		continue;
+				markBBErr(CaI->getParent(), Must_Return_Err, bbErrMap);
+				//CFGEdge edge = make_pair(CaI->getParent()->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = Must_Return_Err;
+				continue;
+			}
+#endif
+			auto FIter = Ctx->CopyFuncs.find(FName.str());
+			if (FIter != Ctx->CopyFuncs.end()) {
+				if (get<1>(FIter->second) == -1) {
+					Value *Arg = CaI->getArgOperand(get<0>(FIter->second));
+					if (isValueErrno(Arg, F)) {
+						markBBErr(CaI->getParent(), Must_Return_Err, bbErrMap);
+						//CFGEdge edge = make_pair(CaI->getParent()->getTerminator(),CE.second);
+						//edgeAttributeMap[edge] = Must_Return_Err;
+						continue;
+					}
+					else {
+						EEV.push_back(make_pair(make_pair(
+										CaI->getParent()->getTerminator(), BB), Arg));
+						continue;
+					}
+				}
+			}
+
+			//We need to comfirm if there is already a check against the return value
+			BasicBlock *CallBB = CaI->getParent();
+			if(CallBB->getTerminator()->getNumSuccessors() > 1){
+				Instruction *TI = CallBB->getTerminator();
+				Instruction *Cond = NULL;
+				if (BranchInst *BI = dyn_cast<BranchInst>(TI))
+					Cond = dyn_cast<Instruction>(BI->getCondition());
+				else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI))
+					Cond = dyn_cast<Instruction>(SI->getCondition());
+				if (Cond){
+					ICmpInst *ICI = dyn_cast<ICmpInst>(Cond);
+					Instruction *I = dyn_cast<Instruction>(Cond);
+					if(ICI){
+						auto oprand0 = I->getOperand(0);
+						auto oprand1 = I->getOperand(1);
+
+						if(isConstant(oprand0) && oprand1 == CaI){
+							auto opconst = dyn_cast<Constant>(oprand0);
+							if(opconst->isNullValue()){
+								//markBBErr(CaI->getParent(), Must_Return_Err, bbErrMap);
+								blockAttributeMap[CaI->getParent()]=Cond;
+							}
+							
+						}
+						else if(isConstant(oprand1) && oprand0 == CaI){
+							auto opconst = dyn_cast<Constant>(oprand1);
+							if(opconst->isNullValue()){
+								//markBBErr(CaI->getParent(), Must_Return_Err, bbErrMap);
+								blockAttributeMap[CaI->getParent()]=Cond;
+							}
+							
+						}
+					}
+					//Not icmp inst, then check if cond is directly used
+					else if (Cond == CaI){
+						blockAttributeMap[CaI->getParent()]=Cond;
+					}
+
+					//Check use chain in this block
+					else{
+
+						/*for(User *U:Cond->users()){
+							if(U == Cond)
+								continue;
+							if(!U->isUsedInBasicBlock(CallBB))
+								continue;
+							
+						}*/
+					}
+				}
+			}
+
+			// Get the actual called function
+			if (Ctx->Callees[CaI].size() == 0)
+				continue;
+
+			CF = *(Ctx->Callees[CaI].begin());
+			
+			if (!CF) {
+				//Note: Add this
+				//The return value of a function
+
+				//BasicBlock *CallBB = CaI->getParent();
+
+				markBBErr(CaI->getParent(), May_Return_Err, bbErrMap);
+				//CFGEdge edge = make_pair(CaI->getParent()->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = May_Return_Err;
+				//blockAttributeMap[edgefirstblock] = V;
+				continue;
+			}
+			
+			if (mayReturnErr(CF)) {
+				//OP << "Here\n";
+				//OP << "FName: "<<FName<<"\n";
+				BasicBlock *CallBB = CaI->getParent();
+				markBBErr(CallBB, May_Return_Err, bbErrMap);
+				//CFGEdge edge = make_pair(CallBB->getTerminator(),CE.second);
+				//edgeAttributeMap[edge] = May_Return_Err;
+				//blockAttributeMap[edgefirstblock] = V;
+
+				// FIXME: assume it will return an error
+				// Assume an immediate check for the return value
+				Instruction *TI = CallBB->getTerminator();
+				if (TI->getNumSuccessors() > 1) {
+					// Decide if the branch condition is the return value
+					Instruction *Cond = NULL;
+					if (BranchInst *BI = dyn_cast<BranchInst>(TI))
+						Cond = dyn_cast<Instruction>(BI->getCondition());
+					else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI))
+						Cond = dyn_cast<Instruction>(SI->getCondition());
+					if (!Cond)
+						continue;
+					std::set<Value *>VSet;
+					findSameVariablesFrom(CaI, VSet);
+					bool Checked = false;
+					for (unsigned i = 0, ie = Cond->getNumOperands(); i < ie; i++) {
+						if (VSet.find(Cond->getOperand(i)) != VSet.end()) {
+							Checked = true;
+							break;
+						}
+					}
+					if (!Checked) 
+						continue;
+
+					int BrId = inferErrBranch(Cond);
+					BasicBlock *ErrSucc;
+					if (BranchInst *BI = dyn_cast<BranchInst>(TI)) {
+						ErrSucc = BI->getSuccessor(BrId);
+					}
+					else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)) {
+						ErrSucc = SI->getSuccessor(BrId);
+					}
+
+					//This edge has been checked before
+					if(bbErrMap.count(ErrSucc) == 1){
+						if(bbErrMap[ErrSucc] == Not_Return_Err)
+							continue;
+					}
+
+					if(ErrSucc == RI->getParent())
+						continue;
+
+					//markBBErr(ErrSucc, Must_Return_Err, bbErrMap);
+					markBBErr(ErrSucc, May_Return_Err, bbErrMap);
+				}
+			}
+			else {
+				markBBErr(CaI->getParent(), May_Return_Err, bbErrMap);
+			}
+			continue;
+		}
+
+		// The value is a icmp instruction. Skip it.
+		// ? Why we do not analysis this?
+		ICmpInst *ICI = dyn_cast<ICmpInst>(V);
+		if (ICI)
+			continue;
+		
+		// The value is a parameter of the fucntion. Skip it.
+		if (isa<Argument>(V))
+			continue;
+
+		if (isConstant(V))
+			continue;
+		
+		// The value is an unary instruction.
+		UnaryInstruction *UI = dyn_cast<UnaryInstruction>(V);
+		if (UI) {
+			Value *UO = UI->getOperand(0);
+			if (isConstant(UO)) {
+				if (isValueErrno(UO, F)) {
+					markBBErr(UI->getParent(), Must_Return_Err, bbErrMap);
+				}
+				else {
+					markBBErr(UI->getParent(), Not_Return_Err, bbErrMap);
+				}
+				continue;
+			}
+			EEV.push_back(std::make_pair(make_pair(UI->getParent()->getTerminator(), BB),
+						UO));
+			continue;
+		}
+		
+		// The value is a binary operator.
+		BinaryOperator *BO = dyn_cast<BinaryOperator>(V);
+		if (BO) {
+			markBBErr(BO->getParent(), Not_Return_Err, bbErrMap);
+			continue;
+		}
+
+		// TODO: support more LLVM IR types.
+#ifdef DEBUG_PRINT
+		OP << "== Warning: unsupported LLVM IR:"
+			<< *V << '\n';
+		assert(0);
+#endif
+
+	}
+	return;
+}
+
+/// Check if the value is an errno.
+bool PairAnalysisPass::isValueErrno(Value *V, Function *F) {
+	// Invalid input.
+	if (!V)
+		return false;
+
+#if ERRNO_TYPE == 2
+	if (ConstantPointerNull *CPN = dyn_cast<ConstantPointerNull>(V)) {
+		if (F->getReturnType()->isPointerTy())
+			return true;
+	}
+#endif
+
+	// The value is a constant integer.
+	if (ConstantInt *CI = dyn_cast<ConstantInt>(V)) {
+
+		const int64_t value = CI->getValue().getSExtValue();
+
+		auto type = V->getType();
+		int bitwidth = type->getIntegerBitWidth();
+		
+		//This is a bool value
+		//Bool value has a different logic from int
+		//For a bool value, true means -1, false means 0
+		if(bitwidth == 1){
+
+			if(value == -1)
+				return false;
+			else
+				return true;
+		}
+
+		//Use this for openssl
+#ifdef OPENSSL_RETURN_STYLE
+		if(value == 0)
+			return true;
+		else
+			return false;
+#endif
+	
+		// The value is an errno (negative or positive).
+		if (is_errno(-value) || is_errno(value)
+#if ERRNO_TYPE == 2
+				|| (-4096 < value && value < 0)
+#endif
+			 ){
+			if(value == -115)	//EINPROGRESS
+				return false;
+			if(value == -110)   //ETIMEDOUT
+				return false;
+			if(value == -512)   //ERESTARTSYS
+				return false;
+
+			return true; 
+		}	
+	}
+
+	// The value is a constant expression.
+	if (ConstantExpr *CE = dyn_cast<ConstantExpr>(V)) {
+		if (CE) {
+			for (unsigned i = 0, e = CE->getNumOperands();
+					i != e; ++i) {
+				if (isValueErrno(CE->getOperand(i), F))
+					return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/// Marking the flag for the block
+void PairAnalysisPass::markBBErr(BasicBlock *BB, 
+		ErrFlag flag, BBErrMap &bbErrMap) {
+	
+	assert(BB);
+
+	if (bbErrMap.count(BB) != 0) {
+		/* if(flag == Must_Return_Err)
+			bbErrMap[BB] = flag;
+		else if(flag == May_Return_Err){
+			if(bbErrMap[BB] != Must_Return_Err)
+				bbErrMap[BB] = flag;
+		}
+		else{
+			if(bbErrMap[BB] != Must_Return_Err && bbErrMap[BB] != May_Return_Err)
+				bbErrMap[BB] = flag;
+		} */
+		bbErrMap[BB] |= flag;
+	}
+		
+	else
+		bbErrMap[BB] = flag;
+
+#ifdef DEBUG_PRINT
+	OP << "# Marking "<<flag<<" for basic block ";
+	BB->printAsOperand(OP, false);
+	OP<<"\n";
+#endif
+}
+
+/// Efficiently but inprecisely check if the function may return an
+/// error
+bool PairAnalysisPass::mayReturnErr(Function *F) {
+
+	std::set<Function *> PF;
+	std::list<Function *> EF;
+
+	PF.clear();
+	EF.clear();
+	EF.push_back(F);
+
+	while (!EF.empty()) {
+
+		Function *TF = EF.front();
+		EF.pop_front();
+
+		if (PF.count(TF) != 0)
+			continue;
+		PF.insert(TF);
+
+		if (TF->empty())
+			continue;
+
+		for (Function::iterator b = TF->begin(), e = TF->end();
+				b != e; ++b) {
+			BasicBlock *BB = &*b;
+			for (BasicBlock::iterator I = BB->begin(),
+					IE = BB->end(); I != IE; ++I) {
+				StoreInst *SI = dyn_cast<StoreInst>(&*I);
+				if (SI) {
+					Value *SV = SI->getValueOperand();
+					if (isValueErrno(SV, TF)) {
+						return true;
+					}
+					continue;
+				}
+				CallInst *CI = dyn_cast<CallInst>(&*I);
+				if (CI) {
+					Type * Ty= CI->getType();
+					if (Ty->isPointerTy())
+						return true;
+					Function *CF = CI->getCalledFunction();
+					if (!CF)
+						continue;
+					StringRef FName = getCalledFuncName(CI);
+					if (FName == "ERR_PTR" || FName == "PTR_ERR")
+						return true;
+					// Get the actual called function
+					if (Ctx->Callees[CI].size() == 0)
+						continue;
+					CF = *(Ctx->Callees[CI].begin());
+					if (CF) {
+						EF.push_back(CF);
+						continue;
+					}
+
+					continue;
+				}
+				ReturnInst *RI = dyn_cast<ReturnInst>(&*I);
+				if (RI) {
+					Value *RV = RI->getReturnValue();
+					if (!RV)
+						continue;
+					if (CallInst *RCI = dyn_cast<CallInst>(RV)) {
+						if (Ctx->Callees[RCI].size() == 0)
+							continue;
+						Function *RF = *(Ctx->Callees[RCI].begin());
+						if (RF)
+							EF.push_back(RF);
+					}
+					continue;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/// Infer error-handling branch for a condition
+int PairAnalysisPass::inferErrBranch(Instruction *Cond) {
+
+	// TODO: determine the error-handling branch
+	
+	/// Infer error-handling branch for a condition. Function is
+	// currently valid only for BranchInst. SwitchInst requires more validation
+	unsigned brID = 0;
+	auto *CmpI = dyn_cast<ICmpInst>(Cond);
+	if (!CmpI)
+		return brID;
+
+	ICmpInst::Predicate Pred = CmpI->getPredicate();
+	Value *V0 = CmpI->getOperand(0);
+	ConstantInt *CIBase = dyn_cast<ConstantInt>(CmpI->getOperand(1));
+
+	if (!CIBase)
+		return brID;
+
+	bool ptrType = V0->getType()->isPointerTy();
+	switch (Pred) {
+		case ICmpInst::ICMP_EQ:
+		// Compare with NULL
+		if (ptrType)
+			return brID;
+		// Is a return value of a callInst
+		else if (CIBase->isZero())
+			return (brID + 1);
+		break;
+
+		case ICmpInst::ICMP_NE:
+		if (ptrType)
+			return (brID + 1);
+		else if (CIBase->isZero())
+			return (brID);
+		break;
+
+		case ICmpInst::ICMP_SLT:
+		//returning value < 0 are often errors
+		if (!ptrType)
+			return CIBase->isZero() ? 0 : 1;
+		break;
+
+		default: break;
+	}
+
+  	return brID;
+	
+	//return 1 by default
+	//return 0;
+}
+
+/// Find same-origin variables from the given variable
+void PairAnalysisPass::findSameVariablesFrom(Value *V, 
+		std::set<Value *> &VSet) {
+
+	VSet.insert(V);
+	std::set<Value *> PV;
+	std::list<Value *> EV;
+
+	PV.clear();
+	EV.clear();
+	EV.push_back(V);
+
+	while (!EV.empty()) {
+
+		Value *TV = EV.front();
+		EV.pop_front();
+		if (PV.find(TV) != PV.end())
+			continue;
+		PV.insert(TV);
+
+		for (User *U : TV->users()) {
+
+			StoreInst *SI = dyn_cast<StoreInst>(U);
+			if (SI && TV == SI->getValueOperand()) {
+				for (User *SU : SI->getPointerOperand()->users()) {
+					LoadInst *LI = dyn_cast<LoadInst>(SU);
+					if (LI) {
+						VSet.insert(LI);
+						EV.push_back(LI);
+					}
+				}
+			}
+		}
+	}
+}
+
+/// Find error handling code
+void PairAnalysisPass::checkErrHandle(Function *F, 
+		BBErrMap &bbErrMap) {
+
+	for (Function::iterator b = F->begin(), e = F->end();
+			b != e; ++b) {
+		BasicBlock *BB = &*b;
+		for (BasicBlock::iterator I = BB->begin(),
+				IE = BB->end(); I != IE; ++I) {
+			CallInst *CI = dyn_cast<CallInst>(&*I);
+			if (CI) {
+				StringRef FuncName = getCalledFuncName(CI);
+
+				// For inline assembly code, just take the first substring
+				// without a space
+				if(FuncName.find(' ') != std::string::npos)
+					FuncName = FuncName.substr(0, FuncName.find(' '));
+
+				string funcName = FuncName.str();
+				if (FuncName.endswith("printk")) 
+					funcName = getSourceFuncName(CI);
+
+				//Still printk, then check the allert parameter (KERN_ERR)
+				if(funcName == "printk"){
+					if(checkprintk(CI)){
+						markBBErr(BB, Must_Handle_Err, bbErrMap);
+					}
+					continue;
+				}
+
+				auto FIter = Ctx->ErrorHandleFuncs.find(funcName);
+				// The called function handles an error, so mark the edge
+				if (FIter != Ctx->ErrorHandleFuncs.end()) {
+					markBBErr(BB, Must_Handle_Err, bbErrMap);
+					continue;
+				}
+
+				// Detect BUG, BUG_ON, WARN_ON more precisely
+#ifdef ASM_FUNC
+				if (FuncName.find("llvm") != std::string::npos || FuncName.empty())
+					continue;
+
+				smatch match;
+				string line;
+				getSourceCodeLine(CI, line);
+
+				if (regex_search(line, match, pattern)) {
+					auto FIter = Ctx->ErrorHandleFuncs.find(match[0].str());
+
+					if (FIter != Ctx->ErrorHandleFuncs.end()) {
+						markBBErr(BB, Must_Handle_Err, bbErrMap);
+						continue;
+					}
+				}
+#endif
+			}
+		}
+	}
+}
+
+// Some return values of function cannot be identified, use this to solve this problem
+void PairAnalysisPass::markCallCases(Function *F,Value * Cond, EdgeErrMap &edgeErrMap){
+
+	if(!Cond)
+		return;
+
+	ICmpInst *ICI = dyn_cast<ICmpInst>(Cond);
+	Instruction *I = dyn_cast<Instruction>(Cond);
+	BasicBlock *BB = I->getParent();
+	auto TI = BB->getTerminator();
+
+	if(ICI){
+
+		ICmpInst::Predicate Pred = ICI->getPredicate();
+        auto oprand0 = I->getOperand(0);
+		auto oprand1 = I->getOperand(1);
+		Value *targeoprand;
+		int nullvalueindex;
+		if(isConstant(oprand0)){
+			nullvalueindex = 0;
+			targeoprand = oprand1;
+		}
+		else {
+			nullvalueindex = 1;
+			targeoprand = oprand0;
+		}
+
+        auto predicate = ICI->getPredicate();
+		if(predicate == llvm::CmpInst::ICMP_EQ){
+
+			BranchInst *BI = dyn_cast<BranchInst>(TI);
+			if(BI){
+
+				CFGEdge edge;
+				if (targeoprand->getType()->isPointerTy())
+					edge = make_pair(TI,TI->getSuccessor(0));
+				else
+					edge = make_pair(TI,TI->getSuccessor(1));
+				edgeErrMap[edge] = Must_Return_Err;	
+			}
+			else{
+				OP << "Not use icmp result in branch inst!\n";
+			}
+
+		}
+		//else if(predicate == llvm::CmpInst::ICMP_NE){
+		else{
+			BranchInst *BI = dyn_cast<BranchInst>(TI);
+			if(BI){
+
+				CFGEdge edge = make_pair(TI,TI->getSuccessor(0));
+				edgeErrMap[edge] = Must_Return_Err;	
+			}
+			else{
+				OP << "Not use icmp result in branch inst!\n";
+			}
+		}
+	}
+
+	PHINode *PN = dyn_cast<PHINode>(Cond);
+	if (PN) {
+		// Check each incoming value.
+		for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+			Value *IV = PN->getIncomingValue(i);
+			BasicBlock *inBB = PN->getIncomingBlock(i);
+
+			// The incoming value is a constant.
+			if (isConstant(IV)) {
+				if (isValueErrno(IV, F)) {
+					auto inBBTI = inBB->getTerminator();
+					CFGEdge edge = make_pair(inBBTI,BB);
+					edgeErrMap[edge] = Must_Return_Err;
+				}
+			} 
+		}
+	}
+
+	//The return value of CAI is directly used in cond
+	CallInst *CAI = dyn_cast<CallInst>(Cond);
+	if(CAI) {
+
+		if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)){
+			if(SI->getCondition() == Cond){
+				for(auto it = SI->case_begin(); it != SI->case_end();it++){
+					auto casevalue = it->getCaseValue();
+					if(isConstant(casevalue)) {
+						if (isValueErrno(casevalue, F)){
+							BasicBlock *Succ = it->getCaseSuccessor();
+							CFGEdge edge = make_pair(TI,Succ);
+							edgeErrMap[edge] = Must_Return_Err;
+						}
+					}
+				}
+			}
+		}
+	}
+
+}
+
+// Traverse the CFG to mark all edges with an error flag
+// This may need modify
+bool PairAnalysisPass::markAllEdgesErrFlag(Function *F, BBErrMap &bbErrMap, 
+		EdgeErrMap &edgeErrMap) {
+
+	if (bbErrMap.size() == 0)
+		return false;
+
+	// Recursively mark flags
+	for (Function::iterator b = F->begin(), e = F->end();
+			b != e; ++b) {
+
+		BasicBlock *BB = &*b;
+
+		// No error-related operations
+		if (bbErrMap.count(BB) == 0)
+			continue;
+
+		// Upon error-related operations, update edges
+		int NewFlag = bbErrMap[BB];
+		// The only marking for error-handling cases
+		if (NewFlag & Must_Handle_Err) {
+			recurMarkEdgesToErrHandle(BB, edgeErrMap);
+		}
+
+		// Marking error-returning cases
+		if ((NewFlag & ERR_RETURN_MASK)) {
+			// First update all edges to the block
+			// mark all predecessor edges with the flag
+			for (BasicBlock *Pred : predecessors(BB)) {
+				CFGEdge CE = std::make_pair(Pred->getTerminator(), BB);
+				updateReturnFlag(edgeErrMap[CE], NewFlag);
+				recurMarkEdgesToBlock(CE, NewFlag, bbErrMap, edgeErrMap);
+			}
+			// Then update all edges from the block
+			for (BasicBlock *Succ : successors(BB)) {
+				CFGEdge CE = std::make_pair(BB->getTerminator(), Succ);
+				updateReturnFlag(edgeErrMap[CE], NewFlag);
+				recurMarkEdgesFromBlock(CE, NewFlag, bbErrMap, edgeErrMap);
+			}
+		}
+	}
+
+	return true;
+}
+
+/// Recursively mark edges from the error-handling block to the
+/// closest branches
+void PairAnalysisPass::recurMarkEdgesToErrHandle(BasicBlock *BB, 
+		EdgeErrMap &edgeErrMap) {
+	// Invalid input.
+	if (!BB)
+		return;
+
+	std::set<BasicBlock *> PB;
+	std::list<BasicBlock *> EB;
+	PB.clear();
+	EB.clear();
+
+	EB.push_back(BB);
+	while (!EB.empty()) {
+
+		BasicBlock *TB = EB.front();
+		EB.pop_front();
+		if (PB.count(TB) != 0)
+			continue;
+		PB.insert(TB);
+		// Iterate on each predecessor basic block.
+		for (BasicBlock *predBB : predecessors(TB)) {
+			Instruction *TI = predBB->getTerminator();	
+			CFGEdge CE = std::make_pair(TI, TB);
+			int NewHandleFlag = Must_Handle_Err;
+			if (edgeErrMap[CE] & NewHandleFlag)
+				continue;
+			updateHandleFlag(edgeErrMap[CE], NewHandleFlag);
+			// reaches a branch, stop
+			if (TI->getNumSuccessors() > 1)
+				continue;
+			EB.push_back(predBB);
+		}
+	}
+}
+
+/// Incorporate flags
+void PairAnalysisPass::updateReturnFlag(int &errFlag, int &newFlag) {
+
+	int ErrReturnMask = ERR_RETURN_MASK;
+
+	//if(errFlag == Must_Return_Err)
+	//	return;
+
+	// update flag for error returning
+	if (newFlag & ErrReturnMask)
+		errFlag = (errFlag & ~ErrReturnMask) | (newFlag & ErrReturnMask);
+}
+
+void PairAnalysisPass::updateHandleFlag(int &errFlag, int &newFlag) {
+
+	int ErrHandleMask = ERR_HANDLE_MASK;  
+
+	// Assume handle flag cannot be updated from Must to May
+	if (errFlag & Must_Handle_Err)
+		return;
+
+	// update flag for error handling
+	if (newFlag & ErrHandleMask)
+		errFlag = (errFlag & ~ErrHandleMask) | (newFlag & ErrHandleMask);
+}
+
+void PairAnalysisPass::mergeFlag(int &errFlag, int &newFlag) {
+
+	int tempFlag = 0;
+
+	if ((errFlag & Must_Return_Err) && (newFlag & Must_Return_Err))
+		tempFlag |= Must_Return_Err;
+	else if ((errFlag & May_Return_Err) || (newFlag & May_Return_Err)) 
+		tempFlag |= May_Return_Err;
+	else if (!(errFlag & ERR_RETURN_MASK))
+		tempFlag |= (newFlag & ERR_RETURN_MASK);
+	else
+		tempFlag |= (errFlag & ERR_RETURN_MASK);
+
+	if ((errFlag & Must_Handle_Err) && (newFlag & Must_Handle_Err))
+		tempFlag |= Must_Handle_Err;
+	else if ((errFlag & May_Handle_Err) || (newFlag & May_Handle_Err)) 
+		tempFlag |= May_Return_Err;
+	else if (!(errFlag & ERR_HANDLE_MASK))
+		tempFlag |= (newFlag & ERR_HANDLE_MASK);
+	else
+		tempFlag |= (errFlag & ERR_HANDLE_MASK);
+
+	// update
+	errFlag = tempFlag;
+}
+
+/// Recursively mark all edges to the given block
+void PairAnalysisPass::recurMarkEdgesToBlock(CFGEdge &CE, int flag, 
+		BBErrMap &bbErrMap, EdgeErrMap &edgeErrMap) {
+
+	Instruction *TI;
+	std::set<CFGEdge> PE;
+	std::list<std::pair<CFGEdge, int>> EEP;
+	PE.clear();
+	EEP.clear();
+
+	EEP.push_back(std::make_pair(CE, flag));
+	while (!EEP.empty()) {
+
+		std::pair<CFGEdge, int> TEP = EEP.front();
+		EEP.pop_front();
+		if (PE.count(TEP.first) != 0)
+			continue;
+		PE.insert(TEP.first);
+
+		BasicBlock *TB = TEP.first.first->getParent();
+		// No predecessors, stop
+		if (pred_size(TB) == 0)
+			continue;
+
+		int IntFlag = TEP.second;
+		// No impact to predecessor edges, so stop
+		if (!(IntFlag & ERR_RETURN_MASK))
+			continue;
+
+		// If the current edge is May_Return_Err, all predecessor edges 
+		// become May_Return_Err 
+		if (IntFlag & May_Return_Err) {
+			recurMarkEdgesToErrReturn(TB, May_Return_Err, edgeErrMap);
+			continue;
+		}
+
+		// The current edge is Must_Return_Err
+		// Integrate flags of all outgoing edges
+		bool AllMust = true, AllZero = true;
+		for (BasicBlock *Succ : successors(TB)) {
+			if (Succ == TEP.first.second)
+				continue;
+			CFGEdge Edge = std::make_pair(TB->getTerminator(), Succ);
+			if (edgeErrMap.count(Edge) == 0) {
+				edgeErrMap[Edge] = May_Return_Err;
+			}
+			if (!(edgeErrMap[Edge] & Must_Return_Err))
+				AllMust = false;
+			else if (edgeErrMap[Edge] & May_Return_Err) {
+				AllMust = false;
+				AllZero = false;
+			}
+			else {
+				AllZero = false;
+			}
+			if (!AllZero && !AllMust) {
+				break;
+			}
+		}
+		if (AllMust) {
+			IntFlag = Must_Return_Err;
+			//markEdgesToErrReturn(TB, IntFlag, edgeErrMap);
+			for (BasicBlock *predBB : predecessors(TB)) {
+				Instruction *TI = predBB->getTerminator();	
+				CFGEdge CE = std::make_pair(TI, TB);
+				if (!(edgeErrMap[CE] & IntFlag)) {
+					updateReturnFlag(edgeErrMap[CE], IntFlag);
+					EEP.push_back(std::make_pair(CE, IntFlag));
+				}
+			}
+		}
+		else if (!AllZero && !AllMust) {
+			recurMarkEdgesToErrReturn(TB, May_Return_Err, edgeErrMap);
+			continue;
+		}
+		else {
+			// FIXME: may want to further track if the flag of predecessors
+			// is zero, but this should a minor issue 
+			continue;
+		}
+	}
+}
+
+/// Recursively mark all edges from the given block
+void PairAnalysisPass::recurMarkEdgesFromBlock(CFGEdge &CE, int flag, 
+		BBErrMap &bbErrMap, EdgeErrMap &edgeErrMap) {
+
+	BasicBlock *BB = CE.second;
+
+	// If BB resets the error, stop tracking
+	if (bbErrMap.count(BB) != 0 && bbErrMap[BB] & ERR_RETURN_MASK)
+		return;
+
+	Instruction *TI;
+
+	std::set<CFGEdge> PE;
+	std::list<std::pair<CFGEdge, int>> EEP;
+	PE.clear();
+	EEP.clear();
+
+	EEP.push_back(std::make_pair(CE, flag));
+	while (!EEP.empty()) {
+
+		std::pair<CFGEdge, int> TEP = EEP.front();
+		EEP.pop_front();
+		if (PE.count(TEP.first) != 0)
+			continue;
+		PE.insert(TEP.first);
+
+		BasicBlock *TB = TEP.first.second;
+		// Iterate on each successor basic block.
+		TI = TB->getTerminator();
+		// No successors, stop
+		if (TI->getNumSuccessors() == 0)
+			continue;
+
+		// Integrate flags of all incoming edges
+		int IntFlag = TEP.second;
+		for (BasicBlock *PredBB : predecessors(TB)) {
+			if (PredBB == TEP.first.first->getParent())
+				continue;
+			Instruction *TI = PredBB->getTerminator();
+			CFGEdge Edge = std::make_pair(TI, TB);
+			if (edgeErrMap.count(Edge) == 0)
+				edgeErrMap[Edge] = 0;
+			mergeFlag(IntFlag, edgeErrMap[Edge]);
+		}
+		for (BasicBlock *Succ : successors(TB)) {
+			CFGEdge CE = std::make_pair(TI, Succ);
+			if ((IntFlag & ERR_RETURN_MASK) != (edgeErrMap[CE] & ERR_RETURN_MASK)) {
+				updateReturnFlag(edgeErrMap[CE], IntFlag);
+				EEP.push_back(std::make_pair(CE, IntFlag));
+			}
+		}
+	}
+}
+
+
+/// Recursively mark edges to the error-returning block
+void PairAnalysisPass::recurMarkEdgesToErrReturn(BasicBlock *BB, 
+		int flag, EdgeErrMap &edgeErrMap) {
+
+	if (!BB)
+		return;
+
+	std::set<BasicBlock *> PB;
+	std::list<BasicBlock *> EB;
+	PB.clear();
+	EB.clear();
+
+	EB.push_back(BB);
+	while (!EB.empty()) {
+
+		BasicBlock *TB = EB.front();
+		EB.pop_front();
+		if (PB.count(TB) != 0)
+			continue;
+		PB.insert(TB);
+		// Iterate on each predecessor basic block.
+		for (BasicBlock *predBB : predecessors(TB)) {
+			Instruction *TI = predBB->getTerminator();	
+			CFGEdge CE = std::make_pair(TI, TB);
+			if ((edgeErrMap[CE] & ERR_RETURN_MASK) ==
+					(flag & ERR_RETURN_MASK))
+				continue;
+			updateReturnFlag(edgeErrMap[CE], flag);
+			EB.push_back(predBB);
+		}
+	}
+}
+
+/// Dump the marked CFG edges.
+void PairAnalysisPass::dumpErrEdges(EdgeErrMap &edgeErrMap) {
+	for (auto it = edgeErrMap.begin(); it != edgeErrMap.end(); ++it) {
+		CFGEdge edge = it->first;
+		int flag = it->second;
+		Instruction *TI = edge.first;
+
+		if (NULL == TI) {
+			OP << "    An errno ";
+			OP << (flag & Must_Return_Err ? "must" : "may");
+			OP << " be returned.\n";
+			continue;
+		}
+		
+		int err_return_flag = flag & ERR_RETURN_MASK;
+		int err_handle_flag = flag & ERR_HANDLE_MASK;
+		if(err_return_flag != Must_Return_Err && err_handle_flag != Must_Handle_Err)
+			continue;
+
+		BasicBlock *predBB = TI->getParent();
+		BasicBlock *succBB = edge.second;
+
+		OP << "    ";
+		predBB->printAsOperand(OP, false);
+		OP << " -> ";
+		succBB->printAsOperand(OP, false);
+		OP << ": <";
+		OP << err_return_flag;
+		OP<<", ";
+		OP << err_handle_flag;
+		OP<<">\n";
+	}
+}
+
+//Return true if this edge is Not_Return_Err
+//Return false if this edge returns err
+bool PairAnalysisPass::checkEdgeErr(CFGEdge edge, EdgeErrMap edgeErrMap){
+
+	//Not tagged, this should be Not_Return_Err
+	if(edgeErrMap.count(edge)==0){
+		return true;
+	}
+
+	int flag = edgeErrMap[edge];
+	int err_return_flag = flag & ERR_RETURN_MASK;
+	int err_handle_flag = flag & ERR_HANDLE_MASK;
+
+	if(err_handle_flag != 0)
+		return false;
+	
+	if(err_return_flag == 1 || err_return_flag == 3)
+		return false;
+
+	return true;
+}

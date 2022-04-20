@@ -1,0 +1,17 @@
+zend_argument_value_error
+zend_ffi_parser_error
+zend_error
+zend_throw_error
+zend_type_error
+php_libxml_ctx_error
+file_error
+php_stream_wrapper_log_error
+zend_argument_error
+zend_argument_type_error
+php_error
+phpdbg_error
+zend_value_error
+tsrm_error
+zend_accel_error
+gd_error
+zend_argument_count_error
